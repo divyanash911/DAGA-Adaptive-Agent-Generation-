@@ -1,0 +1,138 @@
+# DAGA Architecture Templates
+# These YAML templates describe reusable multi-agent configurations.
+# The meta-agent or deterministic router instantiates one of these,
+# then fills in concrete model IDs from the backend registry.
+
+templates:
+
+  # ────────────────────────────────────────────
+  # 1. Single SLM — for trivial / latency-first tasks
+  # ────────────────────────────────────────────
+  single_slm:
+    topology: single_slm
+    description: "One small model handles everything. Fastest, lowest energy."
+    roles:
+      - role_id: solo
+        role_name: solver
+        model_tier: slm_small
+        tools: [bash, file_editor, ast_search, file_reader, test_runner]
+        max_tokens: 4096
+        temperature: 0.2
+
+  # ────────────────────────────────────────────
+  # 2. Single LLM — for moderate well-scoped tasks
+  # ────────────────────────────────────────────
+  single_llm:
+    topology: single_llm
+    description: "One medium LLM. Good for tasks requiring deeper reasoning."
+    roles:
+      - role_id: solo
+        role_name: solver
+        model_tier: llm_medium
+        tools: [bash, file_editor, ast_search, ripgrep, file_reader, test_runner]
+        max_tokens: 8192
+        temperature: 0.2
+
+  # ────────────────────────────────────────────
+  # 3. Sequential pipeline — energy-efficient multi-stage
+  # ────────────────────────────────────────────
+  sequential_pipeline:
+    topology: sequential_pipeline
+    description: |
+      Efficient 3-stage pipeline:
+        - SLM localiser: cheap code search
+        - LLM patcher: high-quality fix
+        - SLM verifier: cheap test validation
+    roles:
+      - role_id: localiser
+        role_name: localiser
+        model_tier: slm_small
+        tools: [ast_search, ripgrep, file_reader]
+        max_tokens: 2048
+        temperature: 0.1
+
+      - role_id: patcher
+        role_name: patcher
+        model_tier: llm_medium
+        tools: [file_reader, file_editor, bash]
+        max_tokens: 8192
+        temperature: 0.2
+
+      - role_id: verifier
+        role_name: verifier
+        model_tier: slm_small
+        tools: [test_runner, bash]
+        max_tokens: 2048
+        temperature: 0.0
+
+  # ────────────────────────────────────────────
+  # 4. Hierarchical — for complex multi-file issues
+  # ────────────────────────────────────────────
+  hierarchical:
+    topology: hierarchical
+    description: |
+      LLM planner decomposes task → SLM executor(s) implement sub-tasks.
+      Good for large repos or multi-module changes.
+    roles:
+      - role_id: planner
+        role_name: planner
+        model_tier: llm_medium
+        tools: [ast_search, ripgrep, file_reader]
+        max_tokens: 4096
+        temperature: 0.1
+
+      - role_id: executor
+        role_name: executor
+        model_tier: slm_small
+        tools: [file_reader, file_editor, bash, test_runner]
+        max_tokens: 6144
+        temperature: 0.2
+
+  # ────────────────────────────────────────────
+  # 5. Parallel ensemble — for critical or complex tasks
+  # ────────────────────────────────────────────
+  parallel_ensemble_3:
+    topology: parallel_ensemble
+    description: |
+      3 independent workers on the same task, majority-vote on patches.
+      Higher energy but better resolve rate on hard problems.
+    roles:
+      - role_id: worker_0
+        role_name: parallel_worker_0
+        model_tier: llm_medium
+        tools: [bash, file_editor, ast_search, ripgrep, file_reader, test_runner]
+        max_tokens: 6144
+        temperature: 0.2
+        parallel_group: 0
+
+      - role_id: worker_1
+        role_name: parallel_worker_1
+        model_tier: llm_medium
+        tools: [bash, file_editor, ast_search, ripgrep, file_reader, test_runner]
+        max_tokens: 6144
+        temperature: 0.4    # slightly higher temp for diversity
+        parallel_group: 0
+
+      - role_id: worker_2
+        role_name: parallel_worker_2
+        model_tier: llm_medium
+        tools: [bash, file_editor, ast_search, ripgrep, file_reader, test_runner]
+        max_tokens: 6144
+        temperature: 0.6
+        parallel_group: 0
+
+  # ────────────────────────────────────────────
+  # 6. Hybrid adaptive — best default for unknown SLA
+  # ────────────────────────────────────────────
+  hybrid_adaptive:
+    topology: hybrid_adaptive
+    description: |
+      Starts with SLM (cheap), escalates tier by tier only on failure.
+      Best for energy-constrained or unknown-complexity tasks.
+    roles:
+      - role_id: adaptive_slm_nano
+        role_name: solver
+        model_tier: slm_nano
+        tools: [bash, file_editor, ast_search, file_reader]
+        max_tokens: 2048
+        temperature: 0.2

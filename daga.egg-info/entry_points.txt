@@ -1,0 +1,2 @@
+[console_scripts]
+daga-eval = daga.evaluation.swebench_harness:main

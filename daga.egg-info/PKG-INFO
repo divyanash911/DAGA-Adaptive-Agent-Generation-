@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: daga
+Version: 0.1.0
+Summary: Dynamic Agentic Architecture Generation — energy-efficient multi-agent task solving
+Requires-Python: >=3.10
+Requires-Dist: httpx>=0.27.0
+Provides-Extra: eval
+Requires-Dist: datasets>=2.20.0; extra == "eval"
+Requires-Dist: swebench>=2.1.0; extra == "eval"
+Provides-Extra: local
+Requires-Dist: vllm>=0.4.0; extra == "local"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-asyncio; extra == "dev"
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
