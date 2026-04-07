@@ -4,6 +4,8 @@
 
 ---
 
+(Add a .env file for env setup)
+
 ## Overview
 
 Most agentic systems apply the same architecture to every task: a single frontier LLM in a ReAct loop, regardless of task complexity. This wastes energy on trivial tasks and underperforms on complex ones.
