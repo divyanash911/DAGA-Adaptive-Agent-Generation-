@@ -24,6 +24,56 @@ score = α · resolve_prob − β · (energy_J / norm) − γ · (latency_s / no
 
 ---
 
+## Methodology
+
+DAGA turns each task (e.g., a SWE-bench issue) into a small decision problem:
+
+> Select an architecture topology $\tau$ and a set of model tiers $m_1, \dots, m_k$ that maximise
+> $$
+>   \text{score} = \alpha \cdot P(\text{resolve})
+>   - \beta \cdot \frac{\text{energy}_J}{E_0}
+>   - \gamma \cdot \frac{\text{latency}_s}{L_0}
+> $$
+> subject to optional constraints on deadline and energy budget.
+
+The implementation follows four main phases, all wired together in `DAGAPipeline`:
+
+1. **Task profiling** (`core.profiler.TaskProfiler`)
+     - Ingests the raw natural language description (+ optional repo metadata).
+     - Extracts **code-aware features**: repo size, estimated affected files, presence of tests / type hints, language.
+     - Extracts **textual features**: entropy, named entities, description length.
+     - Buckets the task into $(\text{domain}, \text{complexity})$ and attaches SLA information (`SLATarget`, deadline, energy cap).
+
+2. **Routing to an architecture**
+     - **Deterministic router** (`core.routing_rules.DeterministicRouter`)
+         - Applies a small set of hand-written rules over the profile (e.g., *trivial + energy-first → `single_slm`*).
+         - Instantiates a template from `configs/architectures.yaml` (topology + roles + default tiers/tools).
+     - **Meta-agent router** (`core.meta_agent.MetaAgentRouter`)
+         - For ambiguous or high-stakes tasks, calls a meta-LLM to *refine* the deterministic suggestion.
+         - The LLM sees the task profile, the rule-based suggestion, and a summary of past experience, and returns a structured `ArchitecturePlan`.
+     - **Model resolution**
+         - `DAGAPipeline._resolve_model_ids` maps each role's `model_tier` to an actual `model_id` using `backends.registry.BackendRegistry`.
+
+3. **Topology execution**
+     - `agents.topologies.create_orchestrator` picks the right orchestrator implementation for the chosen topology.
+     - Each orchestrator delegates to the shared **single-agent executor** in `agents.executor`, which implements a ReAct-style loop
+         with tools from `tools.registry` (shell, file editor, AST search, test runner, etc.).
+     - The execution produces an `ExecutionTrace` object with per-step telemetry (tokens, energy estimate, latency, tool calls) and
+         an optional final patch.
+
+4. **Telemetry and feedback loop**
+     - `telemetry.collector.TelemetryCollector` converts a `(TaskProfile, ArchitecturePlan, ExecutionTrace)` triple into an `ExperienceRecord`.
+     - Each record gets a composite **efficiency score** via `ExperienceRecord.compute_efficiency` using the same $\alpha, \beta, \gamma$ as the router.
+     - `feedback.loop.FeedbackLoop` aggregates these records to answer questions like:
+         - *Which topology is best for COMPLEX Python tasks in medium-sized repos?*
+         - *When does `hybrid_adaptive` beat `sequential_pipeline` under an energy cap?*
+     - This statistical feedback is exposed to the meta-agent to gradually refine its routing behaviour without training a separate model.
+
+These components are designed to be swappable: you can plug in a different profiler, router, or topology while keeping
+the rest of the pipeline unchanged.
+
+---
+
 ## Architecture
 
 ```
@@ -269,6 +319,141 @@ daga/
 ├── tests/
 │   └── test_daga.py       # 42 tests (all pass)
 └── pipeline.py            # Main public entry point
+```
+
+---
+
+## Code Guide: Using DAGA in Your Own Projects
+
+This section highlights the main classes and functions you will typically interact with when integrating DAGA into
+your own tooling or experiments.
+
+### Main entry point: `DAGAPipeline`
+
+- Location: `daga/pipeline.py`
+- Class: `DAGAPipeline`
+- Config: `PipelineConfig`
+
+Minimal usage:
+
+```python
+from daga.pipeline import DAGAPipeline, PipelineConfig
+from daga.backends.registry import build_default_registry
+
+registry = build_default_registry(use_mock=True)  # swap to real backends later
+config = PipelineConfig(
+    verbose=True,
+    alpha=0.6,  # emphasise success
+    beta=0.3,   # penalise energy
+    gamma=0.1,  # penalise latency less
+)
+pipeline = DAGAPipeline(config=config, registry=registry)
+
+task = """Fix the failing test in tests/test_math.py related to edge-case rounding."""
+result = pipeline.run(task_description=task)
+
+print(result.topology_used, result.resolved, result.efficiency_score)
+if result.patch:
+    print(result.patch)
+```
+
+Key arguments to `run`:
+
+- `task_description: str` — natural language description or SWE-bench issue.
+- `repo_metadata: dict` — optional, but improves routing (e.g. `{ "file_count": 120, "has_tests": True }`).
+- `sla_target: SLATarget` — `LATENCY_FIRST`, `ENERGY_FIRST`, `QUALITY_FIRST`, or `BALANCED`.
+- `deadline_seconds`, `max_energy_joules` — hard resource constraints.
+
+The returned `PipelineResult` gives you:
+
+- `resolved: bool` — whether the final patch passed the orchestrator's checks.
+- `patch: Optional[str]` — unified diff patch (if any).
+- `topology_used: str` and `routing_source: str` — which architecture and router were used.
+- `total_latency_s`, `total_energy_j`, `total_tokens` — end-to-end metrics.
+- `efficiency_score` — composite score for this run.
+
+### Customising model backends
+
+- Location: `daga/backends/registry.py`
+- Functions/classes: `BackendRegistry`, `build_default_registry`, `ModelBackend`
+
+You can construct a registry manually and pass it into `DAGAPipeline`:
+
+```python
+from daga.backends.registry import BackendRegistry, OpenAICompatibleBackend
+from daga.core.models import ModelTier
+
+registry = BackendRegistry()
+registry.register(
+    OpenAICompatibleBackend(
+        model_id="gpt-4o-mini",
+        base_url="https://api.openai.com/v1",
+        api_key=os.environ["OPENAI_API_KEY"],
+        tier=ModelTier.LLM_LARGE,
+    ),
+    aliases=["llm_large"],
+)
+
+pipeline = DAGAPipeline(registry=registry)
+```
+
+### Customising tools and sandbox
+
+- Location: `daga/tools/registry.py`
+- Classes: `ToolRegistry`, `Tool`
+
+To add a tool and use a custom workspace directory:
+
+```python
+from daga.tools.registry import ToolRegistry, build_default_tool_registry
+from daga.pipeline import DAGAPipeline, PipelineConfig
+
+tool_registry = build_default_tool_registry("/tmp/my_daga_workspace")
+
+class EchoTool(Tool):
+    @property
+    def name(self):
+        return "echo"
+
+    @property
+    def description(self):
+        return "Echoes its input for debugging."
+
+    @property
+    def schema(self):
+        return {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+
+    def __call__(self, args):
+        return {"output": args["text"]}
+
+tool_registry.register(EchoTool())
+
+pipeline = DAGAPipeline(
+    config=PipelineConfig(workdir="/tmp/my_daga_workspace"),
+    tool_registry=tool_registry,
+)
+```
+
+### Inspecting the experience store
+
+- Location: `daga/telemetry/collector.py`, `daga/feedback/loop.py`
+
+By default, experience records are appended to `PipelineConfig.experience_store_path` (JSONL).
+You can either:
+
+- Call `pipeline.report()` to print an aggregated efficiency report, or
+- Load the JSONL file yourself for custom analysis.
+
+Example minimal report:
+
+```python
+from daga.pipeline import DAGAPipeline
+
+pipeline = DAGAPipeline()
+for task in my_tasks:
+    pipeline.run(task_description=task)
+
+pipeline.report()  # prints per-topology efficiency summary
 ```
 
 ---
