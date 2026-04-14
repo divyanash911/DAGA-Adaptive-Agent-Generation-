@@ -47,7 +47,7 @@ logger = get_logger("daga.pipeline")
 class PipelineConfig:
     # Routing
     always_use_meta_llm:    bool  = False
-    meta_llm_tier:          ModelTier = ModelTier.SLM_SMALL
+    meta_llm_tier:          ModelTier = ModelTier.LLM_MEDIUM
     uncertainty_threshold:  float = 0.65
 
     # Efficiency weights
