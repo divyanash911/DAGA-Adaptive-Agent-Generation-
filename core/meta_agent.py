@@ -1,13 +1,14 @@
 """
-DAGA — Meta-Agent Router
-For cases where deterministic rules are insufficient or the efficiency
-predictor shows high uncertainty, the meta-agent LLM is invoked to
-reason about the best architecture plan.
+DAGA — Meta-Agent Generator
+Generates a task-specific agentic architecture using:
+  - task profile
+  - deterministic bootstrap hints
+  - available model repository
+  - available tool repository
+  - historical experience summary
 
-The meta-agent:
-  1. Receives a structured task profile and efficiency context.
-  2. Returns a JSON plan (topology + roles + reasoning).
-  3. Falls back gracefully to the deterministic rule result if parsing fails.
+The generator emits a JSON DSL, validates it, and instantiates it as an
+ArchitecturePlan consumed by the runtime orchestrators.
 """
 
 from __future__ import annotations
@@ -20,60 +21,83 @@ from daga.backends.registry import BackendRegistry, ModelBackend
 from daga.core.models import (
     AgentRole,
     AgentTopology,
+    ArchitectureBudget,
+    ArchitectureEdge,
     ArchitecturePlan,
+    GeneratedArchitectureSpec,
     ModelTier,
     TaskProfile,
 )
 from daga.core.routing_rules import DeterministicRouter
 from daga.telemetry.logging import get_logger, log_kv
+from daga.tools.registry import ToolRegistry
 
 
-logger = get_logger("daga.router")
+logger = get_logger("daga.architecture")
 
 
-# ──────────────────────────────────────────────
-# Prompt templates
-# ──────────────────────────────────────────────
+ROLE_PROMPT_TEMPLATES: Dict[str, str] = {
+    "solver": "{SYSTEM_PROMPT_SOLVER}",
+    "localiser": "{SYSTEM_PROMPT_LOCALISER}",
+    "patcher": "{SYSTEM_PROMPT_PATCHER}",
+    "verifier": "{SYSTEM_PROMPT_VERIFIER}",
+    "planner": "{SYSTEM_PROMPT_PLANNER}",
+    "executor": "{SYSTEM_PROMPT_EXECUTOR}",
+}
+
 
 META_AGENT_SYSTEM = """\
 You are the architecture meta-agent for DAGA (Dynamic Agentic Architecture Generation).
-Your job is to select the most ENERGY-EFFICIENT and LOW-LATENCY multi-agent architecture
-that can still solve the given software engineering task.
+Your job is to generate the most efficient agentic architecture for the task.
+
+You are NOT only selecting from presets. You can synthesize a task-specific architecture
+using the model repository and tool repository you are given.
 
 OBJECTIVES (in order):
-1. Maximise likelihood of resolving the task (primary)
-2. Minimise total energy consumption (Joules)
-3. Minimise total wall-clock latency (seconds)
+1. Maximise likelihood of resolving the task
+2. Minimise total energy consumption
+3. Minimise total wall-clock latency
 
-AVAILABLE TOPOLOGIES:
-- single_slm           : One small language model (1-7B). Fastest, cheapest.
-- single_llm           : One medium/large LLM. Good for well-scoped tasks.
-- sequential_pipeline  : localiser → patcher → verifier. Balanced efficiency.
-- hierarchical         : planner (large) + executor(s) (small). Good for complex repos.
-- parallel_ensemble    : N agents working in parallel, results voted/merged.
-- hybrid_adaptive      : Starts with SLM, escalates to LLM on failure.
+Return JSON only, with no markdown fences.
 
-AVAILABLE MODEL TIERS (cheapest to most expensive):
-- slm_nano    (1-3B):   ~0.00003 J/token  ~0.3s/step
-- slm_small   (7B):     ~0.00018 J/token  ~1s/step
-- llm_medium  (14-32B): ~0.00070 J/token  ~3s/step
-- llm_large   (70B):    ~0.00190 J/token  ~8s/step
-- llm_frontier (>70B):  ~0.00600 J/token  ~15s/step
-
-RESPONSE FORMAT (JSON only, no markdown fences):
+Required schema:
 {
   "topology": "<topology_enum_value>",
   "reasoning": "<2-3 sentence justification>",
-  "roles": [
+  "agents": [
     {
-      "role_id": "<unique_id>",
-      "role_name": "<name>",
-      "model_tier": "<tier_value>",
-      "tools": ["<tool1>", ...],
+      "id": "<unique_id>",
+      "role": "<solver|planner|localiser|patcher|verifier|executor|custom>",
+      "model": {
+        "tier": "<model_tier_enum_value>",
+        "model_id": "<optional concrete model id from model repository>"
+      },
+      "tools": ["<tool_name>", "..."],
       "max_tokens": <int>,
-      "temperature": <float>
+      "temperature": <float>,
+      "max_iterations": <int>,
+      "parallel_group": <optional int>,
+      "depends_on": ["<role_id>", "..."]
     }
   ],
+  "edges": [
+    {
+      "from": "<role_id>",
+      "to": "<role_id>",
+      "type": "<delegates|feeds|verifies|votes|escalates>"
+    }
+  ],
+  "fallbacks": [
+    {
+      "on": "<event>",
+      "action": "<retry|escalate_model_tier|handoff|stop>"
+    }
+  ],
+  "budgets": {
+    "max_latency_s": <optional float>,
+    "max_energy_j": <optional float>,
+    "max_tokens": <optional int>
+  },
   "predicted_latency_s": <float>,
   "predicted_energy_j": <float>,
   "predicted_resolve_prob": <float>
@@ -83,15 +107,18 @@ RESPONSE FORMAT (JSON only, no markdown fences):
 
 def _build_user_prompt(
     profile: TaskProfile,
-    deterministic_plan: ArchitecturePlan,
+    bootstrap_plan: ArchitecturePlan,
+    model_catalog: List[Dict[str, Any]],
+    tool_catalog: List[Dict[str, Any]],
     experience_summary: Optional[Dict[str, Any]] = None,
 ) -> str:
     exp = ""
     if experience_summary:
-        exp = f"""
-RELEVANT HISTORICAL EXPERIENCE (similar tasks):
-{json.dumps(experience_summary, indent=2)}
-"""
+        exp = (
+            "\nRELEVANT HISTORICAL EXPERIENCE (similar tasks):\n"
+            f"{json.dumps(experience_summary, indent=2)}\n"
+        )
+
     return f"""\
 TASK PROFILE:
   task_id            : {profile.task_id}
@@ -108,189 +135,295 @@ TASK PROFILE:
   deadline_s         : {profile.deadline_seconds}
   max_energy_j       : {profile.max_energy_joules}
 
-DETERMINISTIC RULE SUGGESTION:
-  topology  : {deterministic_plan.topology.value}
-  reasoning : {deterministic_plan.reasoning}
-  roles     : {[r.role_name for r in deterministic_plan.roles]}
-{exp}
-TASK DESCRIPTION (first 600 chars):
-{profile.raw_input[:600]}
+BOOTSTRAP ARCHITECTURE PRIOR:
+  topology  : {bootstrap_plan.topology.value}
+  reasoning : {bootstrap_plan.reasoning}
+  roles     : {[r.role_name for r in bootstrap_plan.roles]}
 
-Produce a JSON architecture plan. If the deterministic suggestion is good, return
-a plan with topology/roles close to it. Override only when you have strong reason
-to believe a different architecture will be more efficient or more likely to succeed.
+MODEL REPOSITORY:
+{json.dumps(model_catalog, indent=2)}
+
+TOOL REPOSITORY:
+{json.dumps(tool_catalog, indent=2)}
+{exp}
+TASK DESCRIPTION (first 1200 chars):
+{profile.raw_input[:1200]}
+
+Generate a task-specific JSON architecture. Use the bootstrap prior when it already fits,
+but customize roles, tool permissions, and model choices when the task benefits from it.
+Prefer the smallest architecture that can plausibly solve the task.
 """
 
 
-# ──────────────────────────────────────────────
-# JSON parser
-# ──────────────────────────────────────────────
+def _role_prompt_template(role_name: str) -> str:
+    if role_name in ROLE_PROMPT_TEMPLATES:
+        return ROLE_PROMPT_TEMPLATES[role_name]
+    lowered = role_name.lower()
+    if "plan" in lowered:
+        return "{SYSTEM_PROMPT_PLANNER}"
+    if "local" in lowered:
+        return "{SYSTEM_PROMPT_LOCALISER}"
+    if "patch" in lowered or "edit" in lowered:
+        return "{SYSTEM_PROMPT_PATCHER}"
+    if "verify" in lowered or "test" in lowered or "critic" in lowered:
+        return "{SYSTEM_PROMPT_VERIFIER}"
+    if "exec" in lowered or "worker" in lowered:
+        return "{SYSTEM_PROMPT_EXECUTOR}"
+    return "{SYSTEM_PROMPT_SOLVER}"
 
-def _parse_plan(
+
+def _clean_json(raw: str) -> str:
+    return re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+
+
+def _parse_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _parse_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _fallback_spec(plan: ArchitecturePlan) -> GeneratedArchitectureSpec:
+    return GeneratedArchitectureSpec(
+        topology=plan.topology,
+        agents=plan.roles,
+        reasoning=plan.reasoning,
+        predicted_latency_s=plan.predicted_latency_s,
+        predicted_energy_j=plan.predicted_energy_j,
+        predicted_resolve_prob=plan.predicted_resolve_prob,
+    )
+
+
+def _parse_generated_spec(
     raw: str,
     task_id: str,
     fallback: ArchitecturePlan,
-) -> ArchitecturePlan:
-    # Strip markdown code fences if present
-    cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+    allowed_tools: List[str],
+) -> GeneratedArchitectureSpec:
+    cleaned = _clean_json(raw)
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        log_kv(logger, 30, "meta_agent.parse.failed", stage="route", task_id=task_id, reason="json_decode_error")
-        return fallback
+        log_kv(logger, 30, "architecture.parse.failed", stage="generate", task_id=task_id, reason="json_decode_error")
+        return _fallback_spec(fallback)
 
     try:
         topology = AgentTopology(data["topology"])
-    except (KeyError, ValueError):
+    except Exception:
         topology = fallback.topology
 
-    roles: List[AgentRole] = []
-    for rd in data.get("roles", []):
+    fallback_roles = {role.role_id: role for role in fallback.roles}
+    edges: List[ArchitectureEdge] = []
+    for edge in data.get("edges", []):
         try:
-            roles.append(AgentRole(
-                role_id            = rd.get("role_id", "role"),
-                role_name          = rd.get("role_name", "agent"),
-                model_tier         = ModelTier(rd["model_tier"]),
-                model_id           = rd.get("model_tier", "slm_small"),
-                tools              = rd.get("tools", ["bash", "file_editor"]),
-                system_prompt_template = "{SYSTEM_PROMPT_SOLVER}",
-                max_tokens         = int(rd.get("max_tokens", 4096)),
-                temperature        = float(rd.get("temperature", 0.2)),
+            edges.append(ArchitectureEdge(
+                from_role_id=str(edge["from"]),
+                to_role_id=str(edge["to"]),
+                edge_type=str(edge.get("type", "delegates")),
             ))
         except Exception:
             continue
 
-    if not roles:
-        roles = fallback.roles
+    role_dependencies: Dict[str, List[str]] = {}
+    for edge in edges:
+        role_dependencies.setdefault(edge.to_role_id, []).append(edge.from_role_id)
 
-    log_kv(
-        logger,
-        20,
-        "meta_agent.parse.ok",
-        stage="route",
-        task_id=task_id,
-        topology=topology.value,
-        n_roles=len(roles),
+    agents: List[AgentRole] = []
+    for idx, agent in enumerate(data.get("agents", [])):
+        try:
+            role_id = str(agent.get("id", f"agent_{idx}"))
+            role_name = str(agent.get("role", "solver"))
+
+            model_info = agent.get("model", {})
+            tier_value = model_info.get("tier") or agent.get("model_tier")
+            model_tier = ModelTier(tier_value) if tier_value else fallback.roles[0].model_tier
+            model_id = str(model_info.get("model_id") or model_tier.value)
+
+            raw_tools = agent.get("tools", [])
+            tools = [tool for tool in raw_tools if tool in allowed_tools]
+            if not tools:
+                fallback_role = fallback_roles.get(role_id)
+                if fallback_role:
+                    tools = [tool for tool in fallback_role.tools if tool in allowed_tools]
+            if not tools:
+                tools = [tool for tool in ["file_reader", "ast_search"] if tool in allowed_tools]
+            if not tools and allowed_tools:
+                tools = allowed_tools[:1]
+
+            depends_on = [str(dep) for dep in agent.get("depends_on", role_dependencies.get(role_id, []))]
+
+            agents.append(AgentRole(
+                role_id=role_id,
+                role_name=role_name,
+                model_tier=model_tier,
+                model_id=model_id,
+                tools=tools,
+                system_prompt_template=_role_prompt_template(role_name),
+                max_tokens=_parse_int(agent.get("max_tokens"), 4096),
+                temperature=_parse_float(agent.get("temperature"), 0.2),
+                max_iterations=_parse_int(agent.get("max_iterations"), 20),
+                parallel_group=agent.get("parallel_group"),
+                depends_on=depends_on,
+            ))
+        except Exception:
+            continue
+
+    if not agents:
+        return _fallback_spec(fallback)
+
+    budgets_data = data.get("budgets", {}) if isinstance(data.get("budgets", {}), dict) else {}
+    return GeneratedArchitectureSpec(
+        topology=topology,
+        agents=agents,
+        edges=edges,
+        fallbacks=data.get("fallbacks", []),
+        budgets=ArchitectureBudget(
+            max_latency_s=_parse_float(budgets_data.get("max_latency_s"), None) if budgets_data.get("max_latency_s") is not None else None,
+            max_energy_j=_parse_float(budgets_data.get("max_energy_j"), None) if budgets_data.get("max_energy_j") is not None else None,
+            max_tokens=_parse_int(budgets_data.get("max_tokens"), 0) or None,
+        ),
+        reasoning=str(data.get("reasoning", fallback.reasoning)),
+        predicted_latency_s=_parse_float(data.get("predicted_latency_s"), fallback.predicted_latency_s),
+        predicted_energy_j=_parse_float(data.get("predicted_energy_j"), fallback.predicted_energy_j),
+        predicted_resolve_prob=_parse_float(data.get("predicted_resolve_prob"), fallback.predicted_resolve_prob or 0.5),
     )
 
-    return ArchitecturePlan(
-        task_id              = task_id,
-        topology             = topology,
-        roles                = roles,
-        routing_source       = "meta_llm",
-        reasoning            = data.get("reasoning", ""),
-        predicted_latency_s  = float(data.get("predicted_latency_s", 0.0)),
-        predicted_energy_j   = float(data.get("predicted_energy_j", 0.0)),
-        predicted_resolve_prob = float(data.get("predicted_resolve_prob", 0.5)),
-    )
 
-
-# ──────────────────────────────────────────────
-# Public class
-# ──────────────────────────────────────────────
-
-class MetaAgentRouter:
+class MetaAgentGenerator:
     """
-    Hybrid router: deterministic rules first, meta-LLM for ambiguous cases.
-
-    Ambiguity criteria (any → invoke LLM):
-      - Predicted resolve probability from rule is below `uncertainty_threshold`
-      - Task is COMPLEX or EPIC
-      - SLA target is QUALITY_FIRST
-      - Developer explicitly requests LLM routing
+    Hybrid architecture generator:
+      1. derive a cheap deterministic bootstrap prior
+      2. optionally invoke an LLM with model/tool repository awareness
+      3. instantiate the generated JSON DSL as an ArchitecturePlan
     """
 
     def __init__(
         self,
         registry: BackendRegistry,
+        tool_registry: Optional[ToolRegistry] = None,
         det_router: Optional[DeterministicRouter] = None,
         meta_model_tier: ModelTier = ModelTier.SLM_SMALL,
         uncertainty_threshold: float = 0.65,
         always_use_llm: bool = False,
     ) -> None:
-        self._registry  = registry
+        self._registry = registry
+        self._tools = tool_registry or ToolRegistry()
         self._det_router = det_router or DeterministicRouter()
-        self._meta_tier  = meta_model_tier
-        self._threshold  = uncertainty_threshold
+        self._meta_tier = meta_model_tier
+        self._threshold = uncertainty_threshold
         self._always_llm = always_use_llm
 
     def _get_meta_backend(self) -> Optional[ModelBackend]:
         backends = self._registry.get_by_tier(self._meta_tier)
         return backends[0] if backends else None
 
+    def _bootstrap_plan(self, profile: TaskProfile) -> ArchitecturePlan:
+        return self._det_router.route_to_plan(profile)
+
     def _should_invoke_llm(
         self,
         profile: TaskProfile,
-        det_plan: ArchitecturePlan,
+        bootstrap_plan: ArchitecturePlan,
     ) -> bool:
         if self._always_llm:
             return True
-        from daga.core.models import TaskComplexity, SLATarget
+
+        from daga.core.models import SLATarget, TaskComplexity
+
         if profile.complexity in (TaskComplexity.COMPLEX, TaskComplexity.EPIC):
             return True
         if profile.sla_target == SLATarget.QUALITY_FIRST:
             return True
-        # No predicted prob for deterministic plans → treat as uncertain for epic
+        if profile.deadline_seconds is not None and profile.deadline_seconds < 30:
+            return False
+        if len(bootstrap_plan.roles) > 2:
+            return True
         return False
 
-    def route(
+    def generate(
         self,
         profile: TaskProfile,
         experience_summary: Optional[Dict[str, Any]] = None,
     ) -> ArchitecturePlan:
-        # Step 1: deterministic baseline
-        det_plan = self._det_router.route_to_plan(profile)
+        bootstrap_plan = self._bootstrap_plan(profile)
 
         log_kv(
             logger,
             20,
-            "routing.deterministic.selected",
-            stage="route",
+            "architecture.bootstrap.selected",
+            stage="generate",
             task_id=profile.task_id,
-            plan_id=det_plan.plan_id,
-            topology=det_plan.topology.value,
-            routing_source=det_plan.routing_source,
-            reasoning=det_plan.reasoning,
+            plan_id=bootstrap_plan.plan_id,
+            topology=bootstrap_plan.topology.value,
+            routing_source=bootstrap_plan.routing_source,
+            reasoning=bootstrap_plan.reasoning,
         )
 
-        invoke = self._should_invoke_llm(profile, det_plan)
+        invoke = self._should_invoke_llm(profile, bootstrap_plan)
         log_kv(
             logger,
             20,
-            "routing.decision",
-            stage="route",
+            "architecture.generation.decision",
+            stage="generate",
             task_id=profile.task_id,
-            plan_id=det_plan.plan_id,
+            plan_id=bootstrap_plan.plan_id,
             invoke_meta_llm=invoke,
             meta_tier=self._meta_tier.value,
             complexity=profile.complexity.value,
             sla_target=profile.sla_target.value,
-            rule_topology=det_plan.topology.value,
+            bootstrap_topology=bootstrap_plan.topology.value,
         )
 
         if not invoke:
-            return det_plan
+            bootstrap_plan.generated_spec = {
+                "topology": bootstrap_plan.topology.value,
+                "agents": [
+                    {
+                        "id": role.role_id,
+                        "role": role.role_name,
+                        "model": {"tier": role.model_tier.value, "model_id": role.model_id},
+                        "tools": role.tools,
+                    }
+                    for role in bootstrap_plan.roles
+                ],
+            }
+            return bootstrap_plan
 
-        # Step 2: LLM refinement
         meta_backend = self._get_meta_backend()
         if meta_backend is None:
-            log_kv(logger, 30, "routing.meta_llm.unavailable", stage="route", task_id=profile.task_id, meta_tier=self._meta_tier.value)
-            return det_plan   # no backend available
+            log_kv(logger, 30, "architecture.meta_llm.unavailable", stage="generate", task_id=profile.task_id, meta_tier=self._meta_tier.value)
+            return bootstrap_plan
 
-        user_prompt = _build_user_prompt(profile, det_plan, experience_summary)
+        model_catalog = self._registry.catalog()
+        tool_catalog = self._tools.catalog()
+        user_prompt = _build_user_prompt(
+            profile=profile,
+            bootstrap_plan=bootstrap_plan,
+            model_catalog=model_catalog,
+            tool_catalog=tool_catalog,
+            experience_summary=experience_summary,
+        )
+
         messages = [
             {"role": "system", "content": META_AGENT_SYSTEM},
-            {"role": "user",   "content": user_prompt},
+            {"role": "user", "content": user_prompt},
         ]
 
         try:
-            log_kv(logger, 20, "routing.meta_llm.call.start", stage="route", task_id=profile.task_id, model_id=meta_backend.model_id)
-            resp = meta_backend.complete(messages, max_tokens=1024, temperature=0.1)
+            log_kv(logger, 20, "architecture.meta_llm.call.start", stage="generate", task_id=profile.task_id, model_id=meta_backend.model_id)
+            resp = meta_backend.complete(messages, max_tokens=1400, temperature=0.1)
             log_kv(
                 logger,
                 20,
-                "routing.meta_llm.call.finish",
-                stage="route",
+                "architecture.meta_llm.call.finish",
+                stage="generate",
                 task_id=profile.task_id,
                 model_id=meta_backend.model_id,
                 latency_s=resp.latency_s,
@@ -298,11 +431,47 @@ class MetaAgentRouter:
                 output_tokens=resp.output_tokens,
                 energy_j=resp.energy_j,
             )
-            llm_plan = _parse_plan(resp.text, profile.task_id, det_plan)
-            llm_plan.routing_source = "hybrid"
-            return llm_plan
+            raw_spec = json.loads(_clean_json(resp.text))
+            spec = _parse_generated_spec(resp.text, profile.task_id, bootstrap_plan, self._tools.list_all())
+            plan = spec.to_plan(
+                task_id=profile.task_id,
+                source="hybrid",
+                raw_spec=raw_spec,
+            )
+            log_kv(
+                logger,
+                20,
+                "architecture.instantiate.ok",
+                stage="generate",
+                task_id=profile.task_id,
+                topology=plan.topology.value,
+                n_roles=len(plan.roles),
+            )
+            return plan
         except Exception as exc:
-            # Graceful fallback
-            log_kv(logger, 40, "routing.meta_llm.failed", stage="route", task_id=profile.task_id, error=str(exc))
-            det_plan.reasoning += f" [LLM routing failed: {exc}; using deterministic]"
-            return det_plan
+            log_kv(logger, 40, "architecture.meta_llm.failed", stage="generate", task_id=profile.task_id, error=str(exc))
+            bootstrap_plan.reasoning += f" [Architecture generation failed: {exc}; using bootstrap]"
+            bootstrap_plan.generated_spec = {
+                "topology": bootstrap_plan.topology.value,
+                "agents": [
+                    {
+                        "id": role.role_id,
+                        "role": role.role_name,
+                        "model": {"tier": role.model_tier.value, "model_id": role.model_id},
+                        "tools": role.tools,
+                    }
+                    for role in bootstrap_plan.roles
+                ],
+            }
+            return bootstrap_plan
+
+    def route(
+        self,
+        profile: TaskProfile,
+        experience_summary: Optional[Dict[str, Any]] = None,
+    ) -> ArchitecturePlan:
+        return self.generate(profile, experience_summary)
+
+
+# Backward-compatible alias while the rest of the codebase migrates.
+MetaAgentRouter = MetaAgentGenerator

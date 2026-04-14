@@ -46,15 +46,17 @@ The implementation follows four main phases, all wired together in `DAGAPipeline
      - Extracts **textual features**: entropy, named entities, description length.
      - Buckets the task into $(\text{domain}, \text{complexity})$ and attaches SLA information (`SLATarget`, deadline, energy cap).
 
-2. **Routing to an architecture**
-     - **Deterministic router** (`core.routing_rules.DeterministicRouter`)
-         - Applies a small set of hand-written rules over the profile (e.g., *trivial + energy-first → `single_slm`*).
-         - Instantiates a template from `configs/architectures.yaml` (topology + roles + default tiers/tools).
-     - **Meta-agent router** (`core.meta_agent.MetaAgentRouter`)
-         - For ambiguous or high-stakes tasks, calls a meta-LLM to *refine* the deterministic suggestion.
-         - The LLM sees the task profile, the rule-based suggestion, and a summary of past experience, and returns a structured `ArchitecturePlan`.
-     - **Model resolution**
-         - `DAGAPipeline._resolve_model_ids` maps each role's `model_tier` to an actual `model_id` using `backends.registry.BackendRegistry`.
+2. **Generating an architecture**
+     - **Deterministic bootstrap** (`core.routing_rules.DeterministicRouter`)
+         - Extracts a cheap initial prior over likely topology families (e.g., *trivial + energy-first → start from `single_slm`*).
+         - Provides constraints and hints, not a final fixed template.
+     - **Meta-agent generator** (`core.meta_agent.MetaAgentRouter`)
+         - Acts as a model-aware, tool-aware architecture generator rather than a pure router.
+         - The meta-agent sees the task profile, bootstrap hints, available model repository, available tool repository, and relevant historical experience.
+         - It emits a **JSON architecture spec** in a domain language for agentic systems: topology, roles, dependencies, tool permissions, escalation rules, and model-tier assignments.
+     - **Architecture instantiation**
+         - The generated JSON DSL is validated and converted into an `ArchitecturePlan`.
+         - `DAGAPipeline._resolve_model_ids` maps each generated role's `model_tier` to an actual `model_id` using `backends.registry.BackendRegistry`.
 
 3. **Topology execution**
      - `agents.topologies.create_orchestrator` picks the right orchestrator implementation for the chosen topology.
@@ -65,13 +67,13 @@ The implementation follows four main phases, all wired together in `DAGAPipeline
 
 4. **Telemetry and feedback loop**
      - `telemetry.collector.TelemetryCollector` converts a `(TaskProfile, ArchitecturePlan, ExecutionTrace)` triple into an `ExperienceRecord`.
-     - Each record gets a composite **efficiency score** via `ExperienceRecord.compute_efficiency` using the same $\alpha, \beta, \gamma$ as the router.
+     - Each record gets a composite **efficiency score** via `ExperienceRecord.compute_efficiency` using the same $\alpha, \beta, \gamma$ as the architecture generator.
      - `feedback.loop.FeedbackLoop` aggregates these records to answer questions like:
          - *Which topology is best for COMPLEX Python tasks in medium-sized repos?*
          - *When does `hybrid_adaptive` beat `sequential_pipeline` under an energy cap?*
-     - This statistical feedback is exposed to the meta-agent to gradually refine its routing behaviour without training a separate model.
+     - This statistical feedback is exposed to the meta-agent to gradually refine its architecture generation behaviour without training a separate model.
 
-These components are designed to be swappable: you can plug in a different profiler, router, or topology while keeping
+These components are designed to be swappable: you can plug in a different profiler, architecture generator, or topology while keeping
 the rest of the pipeline unchanged.
 
 ---
@@ -87,14 +89,14 @@ Task Input
 └──────────┬──────────┘
            │
     ┌──────▼──────────────────────────────────────┐
-    │  Meta-Agent Router                          │
+    │  Meta-Agent Generator                       │
     │  ┌────────────────┐  ┌──────────────────┐   │
-    │  │ Deterministic  │  │  LLM meta-agent  │   │
-    │  │ rule engine    │→ │  (for ambiguous) │   │
+    │  │ Bootstrap      │  │  Model/tool-aware│   │
+    │  │ priors/rules   │→ │  LLM generator   │   │
     │  └────────────────┘  └──────────────────┘   │
     └─────────────────────────────────────────────┘
            │
-    Selects one of 6 topologies:
+    Instantiates a task-specific architecture:
     ┌──────────────┬───────────────────┬──────────────────┐
     │  single_slm  │ sequential_pipeline│ parallel_ensemble│
     │  single_llm  │ hierarchical       │ hybrid_adaptive  │
@@ -110,6 +112,55 @@ Task Input
     │  → Feedback Loop               │
     └────────────────────────────────┘
 ```
+
+---
+
+## Architecture DSL
+
+Instead of selecting only from a small fixed set of templates, DAGA can treat architecture design itself as a generation problem.
+The meta-agent produces a JSON document in a domain language for agentic systems, then the runtime instantiates that description.
+
+Conceptually, the generated DSL can express:
+
+| Field | Meaning |
+|---|---|
+| `topology` | Overall coordination pattern (`single`, `pipeline`, `hierarchical`, `parallel`, `adaptive`) |
+| `agents` | Roles to instantiate (`planner`, `localiser`, `patcher`, `verifier`, `critic`, etc.) |
+| `model_policy` | Which model tier or concrete model each role should use |
+| `tool_policy` | Which subset of the tool repository each role may access |
+| `edges` | Data/control flow between roles |
+| `fallbacks` | Escalation and retry behaviour |
+| `budgets` | Token, latency, and energy constraints |
+
+Illustrative example:
+
+```json
+{
+  "topology": "hierarchical",
+  "agents": [
+    {
+      "id": "planner",
+      "role": "planner",
+      "model": { "tier": "llm_medium" },
+      "tools": ["file_reader", "ripgrep", "ast_search"]
+    },
+    {
+      "id": "patcher",
+      "role": "patcher",
+      "model": { "tier": "slm_small" },
+      "tools": ["file_reader", "file_editor", "bash", "test_runner"]
+    }
+  ],
+  "edges": [
+    { "from": "planner", "to": "patcher", "type": "delegates" }
+  ],
+  "fallbacks": [
+    { "on": "verification_failure", "action": "escalate_model_tier" }
+  ]
+}
+```
+
+In practice, this means the meta-agent is aware of the **model repository** and **tool repository** before execution begins, and can synthesize a task-specific architecture instead of merely choosing a static preset.
 
 ---
 
@@ -299,8 +350,8 @@ daga/
 ├── core/
 │   ├── models.py          # Data models (TaskProfile, ArchitecturePlan, etc.)
 │   ├── profiler.py        # Task profiler — extracts complexity signals
-│   ├── routing_rules.py   # Deterministic rule engine (10 rules, O(1))
-│   ├── meta_agent.py      # LLM meta-agent router (for ambiguous cases)
+│   ├── routing_rules.py   # Deterministic bootstrap hints and guardrails
+│   ├── meta_agent.py      # LLM meta-agent generator for architecture DSL
 │   └── predictor.py       # Forward model: predict energy/latency before execution
 ├── agents/
 │   ├── executor.py        # Single-agent ReAct loop
@@ -313,11 +364,11 @@ daga/
 ├── telemetry/
 │   └── collector.py       # Telemetry collection + experience store
 ├── feedback/
-│   └── loop.py            # Efficiency analysis + routing recommendations
+│   └── loop.py            # Efficiency analysis + architecture recommendations
 ├── evaluation/
 │   └── swebench_harness.py # SWE-bench evaluation harness
 ├── configs/
-│   └── architectures.yaml # YAML architecture templates
+│   └── architectures.yaml # Seed templates / priors for generated architectures
 ├── tests/
 │   └── test_daga.py       # 42 tests (all pass)
 └── pipeline.py            # Main public entry point
@@ -362,7 +413,7 @@ if result.patch:
 Key arguments to `run`:
 
 - `task_description: str` — natural language description or SWE-bench issue.
-- `repo_metadata: dict` — optional, but improves routing (e.g. `{ "file_count": 120, "has_tests": True }`).
+- `repo_metadata: dict` — optional, but improves architecture generation (e.g. `{ "file_count": 120, "has_tests": True }`).
 - `sla_target: SLATarget` — `LATENCY_FIRST`, `ENERGY_FIRST`, `QUALITY_FIRST`, or `BALANCED`.
 - `deadline_seconds`, `max_energy_joules` — hard resource constraints.
 
@@ -370,7 +421,7 @@ The returned `PipelineResult` gives you:
 
 - `resolved: bool` — whether the final patch passed the orchestrator's checks.
 - `patch: Optional[str]` — unified diff patch (if any).
-- `topology_used: str` and `routing_source: str` — which architecture and router were used.
+- `topology_used: str` and `routing_source: str` — which architecture was instantiated and whether it came from deterministic bootstrap, meta-generation, or a hybrid path.
 - `total_latency_s`, `total_energy_j`, `total_tokens` — end-to-end metrics.
 - `efficiency_score` — composite score for this run.
 
@@ -462,22 +513,22 @@ pipeline.report()  # prints per-topology efficiency summary
 
 ## Design Decisions
 
-### Why deterministic rules first?
-Rules cover ~80% of cases in O(1) with zero tokens spent. The meta-agent LLM is only invoked for COMPLEX/EPIC tasks or QUALITY_FIRST SLA, reducing the routing overhead by ~5-10× vs always calling the LLM.
+### Why use deterministic bootstrap before generation?
+Cheap rules cover many easy cases in O(1) with zero tokens spent, and they also provide useful priors and safety guardrails for the generator. The meta-agent then spends its reasoning budget on architecture synthesis only when the task is ambiguous, high-stakes, or structurally complex.
 
 ### Why estimate energy rather than measure it?
-Hardware power monitors require root access and vary by machine. The per-tier J/token estimates (from TokenPowerBench and Wilhelm et al. 2025) are accurate to ~15% and sufficient for routing decisions. When more accuracy is needed, RAPL (Intel) or `nvidia-smi` readings can replace the estimates.
+Hardware power monitors require root access and vary by machine. The per-tier J/token estimates (from TokenPowerBench and Wilhelm et al. 2025) are accurate to ~15% and sufficient for architecture decisions. When more accuracy is needed, RAPL (Intel) or `nvidia-smi` readings can replace the estimates.
 
 ### Why not train a neural router?
-Statistical rule refinement (the feedback loop) is interpretable, debuggable, and doesn't need a separate training pipeline. A neural router would improve accuracy by ~3–5% at the cost of a training loop and model drift.
+Statistical feedback over generated architectures is interpretable, debuggable, and doesn't need a separate training pipeline. A learned neural router could improve selection accuracy, but it would still be less expressive than directly generating a task-specific architecture over the model and tool repositories.
 
 ### Novelty vs prior work
 | Prior work | DAGA difference |
 |---|---|
-| LLM routing (RouteLLM, Frugal-GPT) | DAGA routes *architectures*, not just models |
+| LLM routing (RouteLLM, Frugal-GPT) | DAGA generates *architectures*, not just model choices |
 | SWE-agent, Agentless | Fixed single-agent; DAGA adapts topology per task |
-| MoA (Mixture of Agents) | Always parallel; DAGA chooses topology dynamically |
-| AutoGen, CrewAI | Manual topology config; DAGA generates it automatically |
+| MoA (Mixture of Agents) | Always parallel; DAGA synthesizes topology dynamically |
+| AutoGen, CrewAI | Manual topology config; DAGA generates it automatically from task + model/tool availability |
 
 ---
 
@@ -501,7 +552,7 @@ python -m pytest daga/tests/test_daga.py::TestPipeline -v
 1. Add a value to `AgentTopology` enum in `core/models.py`
 2. Create an orchestrator class inheriting from `TopologyOrchestrator` in `agents/topologies.py`
 3. Register it in the `create_orchestrator` factory
-4. Add a routing rule in `core/routing_rules.py`
+4. Add a bootstrap rule or generation constraint in `core/routing_rules.py`
 5. Add TOPOLOGY_COST_MULTIPLIER entry in `core/predictor.py`
 
 ### Adding a new backend

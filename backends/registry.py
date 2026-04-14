@@ -473,6 +473,20 @@ class BackendRegistry:
     def list_all(self) -> List[str]:
         return list(self._backends)
 
+    def catalog(self) -> List[Dict[str, Any]]:
+        seen: set[str] = set()
+        entries: List[Dict[str, Any]] = []
+        for backend in self._backends.values():
+            if backend.model_id in seen:
+                continue
+            seen.add(backend.model_id)
+            entries.append({
+                "model_id": backend.model_id,
+                "tier": backend.tier.value,
+                "energy_profile": MODEL_ENERGY_PROFILE.get(backend.tier, {}),
+            })
+        return sorted(entries, key=lambda item: (item["tier"], item["model_id"]))
+
     def cheapest_for_tier(self, tier: ModelTier) -> Optional[ModelBackend]:
         """Returns the first registered backend of the given tier (used as default)."""
         options = self.get_by_tier(tier)

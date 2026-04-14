@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 
 from daga.agents.topologies import create_orchestrator
 from daga.backends.registry import BackendRegistry, build_default_registry
-from daga.core.meta_agent import MetaAgentRouter
+from daga.core.meta_agent import MetaAgentGenerator
 from daga.core.models import (
     ArchitecturePlan,
     ExecutionTrace,
@@ -119,8 +119,9 @@ class DAGAPipeline:
 
         self.profiler     = TaskProfiler()
         self.det_router   = DeterministicRouter()
-        self.meta_router  = MetaAgentRouter(
+        self.meta_router  = MetaAgentGenerator(
             registry              = self.registry,
+            tool_registry         = self.tool_registry,
             det_router            = self.det_router,
             meta_model_tier       = self.config.meta_llm_tier,
             uncertainty_threshold = self.config.uncertainty_threshold,
@@ -190,7 +191,7 @@ class DAGAPipeline:
 
         # ── Phase 2: Route ────────────────────────────────────
         experience_summary = self.feedback.experience_summary_for_meta_agent(profile)
-        plan = self.meta_router.route(profile, experience_summary)
+        plan = self.meta_router.generate(profile, experience_summary)
         plan = self._resolve_model_ids(plan)
 
         log_kv(

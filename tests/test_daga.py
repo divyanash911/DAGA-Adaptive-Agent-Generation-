@@ -598,10 +598,12 @@ class TestMetaAgentRouter:
     def test_deterministic_for_simple(self, mock_registry, simple_profile):
         router = MetaAgentRouter(
             registry     = mock_registry,
+            tool_registry= build_default_tool_registry("/tmp"),
             always_use_llm = False,
         )
         plan = router.route(simple_profile)
         assert plan.routing_source == "deterministic"
+        assert plan.generated_spec is not None
 
     def test_meta_llm_invoked_for_complex(self, mock_registry):
         # Mock LLM returns a valid JSON plan
@@ -631,11 +633,13 @@ class TestMetaAgentRouter:
         )
         router = MetaAgentRouter(
             registry       = mock_registry,
+            tool_registry  = build_default_tool_registry("/tmp"),
             meta_model_tier= ModelTier.SLM_SMALL,
         )
         plan = router.route(complex_p)
         # Should have used hybrid path (det + LLM refinement)
         assert plan.routing_source in ("hybrid", "meta_llm", "deterministic")
+        assert plan.generated_spec is not None
 
 
 # ──────────────────────────────────────────────

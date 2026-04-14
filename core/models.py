@@ -28,7 +28,7 @@ class TaskDomain(str, Enum):
 
 
 class TaskComplexity(str, Enum):
-    """Coarse complexity bucket used by the router."""
+    """Coarse complexity bucket used by the architecture generator."""
     TRIVIAL  = "trivial"    # < 5 files, clear root cause
     SIMPLE   = "simple"     # single-file patch, known pattern
     MODERATE = "moderate"   # multi-file, some cross-module reasoning
@@ -112,6 +112,7 @@ class AgentRole:
     max_iterations: int = 20   # per-role iteration cap; verifier should be much lower
     # For parallel topologies
     parallel_group: Optional[int] = None
+    depends_on: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -121,7 +122,7 @@ class ArchitecturePlan:
     topology: AgentTopology = AgentTopology.SINGLE_SLM
     roles: List[AgentRole] = field(default_factory=list)
 
-    # Predicted efficiency metrics (from router's forward model)
+    # Predicted efficiency metrics (from generator's forward model)
     predicted_latency_s: float = 0.0
     predicted_energy_j: float = 0.0
     predicted_resolve_prob: float = 0.0
@@ -130,7 +131,53 @@ class ArchitecturePlan:
     # Routing meta
     routing_source: str = "deterministic"  # "deterministic" | "meta_llm" | "hybrid"
     reasoning: str = ""
+    generated_spec: Optional[Dict[str, Any]] = None
     created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class ArchitectureEdge:
+    from_role_id: str
+    to_role_id: str
+    edge_type: str = "delegates"
+
+
+@dataclass
+class ArchitectureBudget:
+    max_latency_s: Optional[float] = None
+    max_energy_j: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+
+@dataclass
+class GeneratedArchitectureSpec:
+    topology: AgentTopology = AgentTopology.SINGLE_SLM
+    agents: List[AgentRole] = field(default_factory=list)
+    edges: List[ArchitectureEdge] = field(default_factory=list)
+    fallbacks: List[Dict[str, Any]] = field(default_factory=list)
+    budgets: ArchitectureBudget = field(default_factory=ArchitectureBudget)
+    reasoning: str = ""
+    predicted_latency_s: float = 0.0
+    predicted_energy_j: float = 0.0
+    predicted_resolve_prob: float = 0.0
+
+    def to_plan(
+        self,
+        task_id: str,
+        source: str,
+        raw_spec: Optional[Dict[str, Any]] = None,
+    ) -> ArchitecturePlan:
+        return ArchitecturePlan(
+            task_id=task_id,
+            topology=self.topology,
+            roles=self.agents,
+            predicted_latency_s=self.predicted_latency_s,
+            predicted_energy_j=self.predicted_energy_j,
+            predicted_resolve_prob=self.predicted_resolve_prob,
+            routing_source=source,
+            reasoning=self.reasoning,
+            generated_spec=raw_spec,
+        )
 
 
 # ──────────────────────────────────────────────

@@ -159,7 +159,7 @@ def _estimate_complexity(
 class TaskProfiler:
     """
     Converts a raw task description + optional repo metadata into a
-    structured TaskProfile used by the meta-agent router.
+    structured TaskProfile used by the architecture generator.
     """
 
     def profile(

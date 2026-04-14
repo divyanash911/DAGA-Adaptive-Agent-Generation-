@@ -496,6 +496,16 @@ class ToolRegistry:
     def list_all(self) -> List[str]:
         return list(self._tools)
 
+    def catalog(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": name,
+                "description": tool.description,
+                "schema": tool.schema,
+            }
+            for name, tool in sorted(self._tools.items())
+        ]
+
     def get_schemas(self, names: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         selected = names or list(self._tools)
         return [

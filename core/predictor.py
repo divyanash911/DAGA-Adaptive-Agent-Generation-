@@ -4,7 +4,7 @@ A lightweight forward model that predicts (latency, energy, resolve_probability)
 for a given (TaskProfile, ArchitecturePlan) pair BEFORE execution.
 
 Used by:
-  - MetaAgentRouter: to compare candidate plans and pick the most efficient
+  - MetaAgentGenerator: to compare candidate plans and pick the most efficient
   - DeterministicRouter: to annotate plans with predicted metrics
 
 Design:
